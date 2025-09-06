@@ -2,6 +2,8 @@ package raf.console.mirror
 
 import android.Manifest
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -10,15 +12,21 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
 import android.provider.Settings
+import android.util.Size
 import android.view.ViewGroup
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.ExperimentalGetImage
+import androidx.camera.core.FocusMeteringAction
+import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FallbackStrategy
@@ -66,11 +74,17 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import com.google.mlkit.vision.barcode.BarcodeScannerOptions
+import com.google.mlkit.vision.barcode.BarcodeScanning
+import com.google.mlkit.vision.barcode.common.Barcode
+import com.google.mlkit.vision.common.InputImage
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Locale
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.math.max
 
 class MainActivity : ComponentActivity() {
@@ -78,8 +92,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         if (intent?.action == "raf.console.mirror.OPEN_MAIN") {
-            // сюда попадаем, если запустили из плитки
-            // можно, например, сразу запросить фокус камеры или показать тост
+            // запуск из плитки
         }
 
         setContent {
@@ -90,7 +103,6 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
-
 }
 
 @Composable
@@ -157,6 +169,35 @@ private fun MirrorScreen() {
     var doMirror by remember { mutableStateOf(true) }   // зеркалить превью (только фронталка)
     var torchOn by remember { mutableStateOf(false) }   // фонарик (тыл)
 
+    // --- QR-сканер (непрерывный) ---
+    var qrMode by remember { mutableStateOf(false) }          // режим сканера
+    var showQrDialog by remember { mutableStateOf(false) }    // показать диалог результата
+    var lastQr by remember { mutableStateOf<String?>(null) }  // последний показанный текст
+
+    // анти-спам: не показывать одинаковое значение чаще, чем раз в N мс
+    val COOLDOWN_MS = 1200L
+    var lastShownValue by remember { mutableStateOf<String?>(null) }
+    var lastShownAt by remember { mutableStateOf(0L) }
+
+    val scannerOptions = remember {
+        // только QR — быстрее и точнее
+        BarcodeScannerOptions.Builder()
+            .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
+            .build()
+    }
+    val barcodeScanner = remember { BarcodeScanning.getClient(scannerOptions) }
+    var analysis: ImageAnalysis? by remember { mutableStateOf(null) }
+
+    fun resetQrState() {
+        // не трогаем lastShownValue/At — они как фильтр от спама
+        lastQr = null
+        showQrDialog = false
+    }
+
+    // фоновый executor для анализа
+    val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
+    DisposableEffect(Unit) { onDispose { cameraExecutor.shutdown() } }
+
     val previewView = remember {
         PreviewView(activity).apply {
             layoutParams = ViewGroup.LayoutParams(
@@ -202,6 +243,7 @@ private fun MirrorScreen() {
     val mainExecutor = remember { ContextCompat.getMainExecutor(activity) }
     val cameraProviderFuture = remember { ProcessCameraProvider.getInstance(activity) }
 
+    @OptIn(ExperimentalGetImage::class)
     fun bindCamera() {
         cameraProviderFuture.addListener({
             val cameraProvider = runCatching { cameraProviderFuture.get() }.getOrNull() ?: return@addListener
@@ -223,11 +265,54 @@ private fun MirrorScreen() {
                 .build()
             val vidCap = VideoCapture.withOutput(recorder)
 
+            // Анализатор кадров для QR (работает пока qrMode = true)
+            val analysisUseCase = if (qrMode) {
+                ImageAnalysis.Builder()
+                    .setTargetResolution(Size(1280, 720))
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .build().also { analysisUC ->
+                        analysisUC.setAnalyzer(cameraExecutor) { imageProxy: ImageProxy ->
+                            val mediaImage = imageProxy.image ?: run {
+                                imageProxy.close(); return@setAnalyzer
+                            }
+                            val rotation = imageProxy.imageInfo.rotationDegrees
+                            val image = InputImage.fromMediaImage(mediaImage, rotation)
+
+                            barcodeScanner.process(image)
+                                .addOnSuccessListener { barcodes ->
+                                    // непрерывный режим: не показываем новый диалог, если старый открыт
+                                    if (!showQrDialog) {
+                                        val now = System.currentTimeMillis()
+                                        val hit = barcodes.firstOrNull { !it.rawValue.isNullOrBlank() }?.rawValue
+                                        if (!hit.isNullOrBlank()) {
+                                            // фильтр: одинаковые значения — не чаще, чем раз в COOLDOWN_MS
+                                            val allowByValue = hit != lastShownValue || (now - lastShownAt) >= COOLDOWN_MS
+                                            if (allowByValue) {
+                                                lastQr = hit
+                                                lastShownValue = hit
+                                                lastShownAt = now
+                                                showQrDialog = true
+                                            }
+                                        }
+                                    }
+                                }
+                                .addOnFailureListener { /* ignore */ }
+                                .addOnCompleteListener { imageProxy.close() }
+                        }
+                    }
+            } else null
+
             runCatching {
                 cameraProvider.unbindAll()
-                camera = cameraProvider.bindToLifecycle(lifecycleOwner, selector, preview, imgCap, vidCap)
+
+                camera = if (analysisUseCase != null) {
+                    cameraProvider.bindToLifecycle(lifecycleOwner, selector, preview, imgCap, vidCap, analysisUseCase)
+                } else {
+                    cameraProvider.bindToLifecycle(lifecycleOwner, selector, preview, imgCap, vidCap)
+                }
                 imageCapture = imgCap
                 videoCapture = vidCap
+                analysis = analysisUseCase
 
                 if (useFront) {
                     torchOn = false
@@ -238,11 +323,28 @@ private fun MirrorScreen() {
                     }
                 }
                 zoomRatio = camera?.cameraInfo?.zoomState?.value?.zoomRatio ?: 1f
+
+                // автофокус по центру — повышает шанс считывания
+                previewView.post {
+                    val factory = previewView.meteringPointFactory
+                    val point = factory.createPoint(
+                        previewView.width / 2f,
+                        previewView.height / 2f
+                    )
+                    val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF)
+                        .setAutoCancelDuration(2, TimeUnit.SECONDS)
+                        .build()
+                    camera?.cameraControl?.startFocusAndMetering(action)
+                }
             }
         }, mainExecutor)
     }
 
     LaunchedEffect(useFront) { bindCamera() }
+    LaunchedEffect(qrMode) {
+        resetQrState()
+        bindCamera()
+    }
 
     // --- эффекты при фото ---
     fun playPhotoFx() = scope.launch {
@@ -298,19 +400,8 @@ private fun MirrorScreen() {
         }).build()
 
         var pending = vidCap.output.prepareRecording(activity, output)
-        if (ActivityCompat.checkSelfPermission(
-                context,
-                Manifest.permission.RECORD_AUDIO
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
-            // TODO: Consider calling
-            //    ActivityCompat#requestPermissions
-            // here to request the missing permissions, and then overriding
-            //   public void onRequestPermissionsResult(int requestCode, String[] permissions,
-            //                                          int[] grantResults)
-            // to handle the case where the user grants the permission. See the documentation
-            // for ActivityCompat#requestPermissions for more details.
-
+        if (ActivityCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            // без звука
         }
         if (hasAudio) pending = pending.withAudioEnabled()
 
@@ -331,85 +422,39 @@ private fun MirrorScreen() {
     // Жесты: зум (щипок) + фото/видео (тап/лонг-тап)
     val gestureLayer = Modifier
         .fillMaxSize()
-        .pointerInput(useFront, doMirror) {
-            detectTransformGestures { _: Offset, _: Offset, zoomChange: Float, _: Float ->
-                val cam = camera ?: return@detectTransformGestures
-                val info = cam.cameraInfo
-                val minZ = info.zoomState.value?.minZoomRatio ?: 1f
-                val maxZ = info.zoomState.value?.maxZoomRatio ?: 10f
-                val newZ = (zoomRatio * zoomChange).coerceIn(minZ, maxZ)
-                zoomRatio = newZ
-                cam.cameraControl.setZoomRatio(newZ)
-            }
-        }
-        /*.pointerInput(Unit) {
-            detectTapGestures(
-                onLongPress = {
-                    // Старт видео при долгом тапе — работает и для тыла, и для фронта
-                    if (activeRecording == null) {
-                        activeRecording = startRecording()
-                    }
-                },
-                onPress = {
-                    // Ждём отпускания пальца. Если к этому моменту запись началась — останавливаем,
-                    // иначе это короткий тап => фото.
-                    val wasRecordingAtPress = activeRecording != null
-                    val released = tryAwaitRelease()
-                    if (wasRecordingAtPress) {
-                        stopRecording()
-                    } else if (released) {
-                        takePhoto()
+        .then(
+            if (qrMode) Modifier   // в режиме QR не мешаем скану
+            else Modifier
+                .pointerInput(useFront, doMirror) {
+                    detectTransformGestures { _: Offset, _: Offset, zoomChange: Float, _: Float ->
+                        val cam = camera ?: return@detectTransformGestures
+                        val info = cam.cameraInfo
+                        val minZ = info.zoomState.value?.minZoomRatio ?: 1f
+                        val maxZ = info.zoomState.value?.maxZoomRatio ?: 10f
+                        val newZ = (zoomRatio * zoomChange).coerceIn(minZ, maxZ)
+                        zoomRatio = newZ
+                        cam.cameraControl.setZoomRatio(newZ)
                     }
                 }
-            )
-        }*/
-        /*.pointerInput(Unit) {
-            detectTapGestures(
-                onLongPress = {
-                    // старт видео при долгом нажатии
-                    if (activeRecording == null) {
-                        activeRecording = startRecording()
-                    }
-                },
-                onPress = {
-                    // ждём отпускания
-                    val released = tryAwaitRelease()
-
-                    // ВАЖНО: проверяем текущее состояние,
-                    // а не то, что было в момент начала onPress.
-                    if (activeRecording != null) {
-                        // если во время удержания запустилось видео — останавливаем
-                        stopRecording()
-                    } else if (released) {
-                        // иначе это был короткий тап — фото
-                        takePhoto()
-                    }
+                .pointerInput(Unit) {
+                    detectTapGestures(
+                        onTap = {
+                            if (activeRecording != null) {
+                                stopRecording()
+                            } else {
+                                takePhoto()
+                            }
+                        },
+                        onLongPress = {
+                            if (activeRecording == null) {
+                                activeRecording = startRecording()
+                            } else {
+                                stopRecording()
+                            }
+                        }
+                    )
                 }
-            )
-        }*/
-        .pointerInput(Unit) {
-            detectTapGestures(
-                onTap = {
-                    // если идёт запись — останавливаем, иначе делаем фото
-                    if (activeRecording != null) {
-                        stopRecording()
-                    } else {
-                        takePhoto()
-                    }
-                },
-                onLongPress = {
-                    // долгое нажатие: старт записи (или стоп, если уже идёт)
-                    if (activeRecording == null) {
-                        activeRecording = startRecording()
-                    } else {
-                        stopRecording()
-                    }
-                }
-                // onPress не нужен — иначе можно снова спровоцировать фото
-            )
-        }
-
-
+        )
 
     Box(Modifier.fillMaxSize()) {
         AndroidView(
@@ -427,6 +472,10 @@ private fun MirrorScreen() {
             frameScale = frameScale.value
         )
 
+        if (qrMode) {
+            QrOverlay()
+        }
+
         if (activeRecording != null) {
             RecordingHud(elapsed = elapsedText)
         }
@@ -441,6 +490,7 @@ private fun MirrorScreen() {
                 useFront = useFront,
                 doMirror = doMirror,
                 torchOn = torchOn,
+                qrMode = qrMode,
                 onToggleCamera = {
                     useFront = !useFront
                     if (useFront) {
@@ -461,7 +511,8 @@ private fun MirrorScreen() {
                             if (hasFlash) cam.cameraControl.enableTorch(torchOn) else torchOn = false
                         }
                     }
-                }
+                },
+                onToggleQr = { qrMode = !qrMode }
             )
         }
 
@@ -478,6 +529,38 @@ private fun MirrorScreen() {
                 }
             )
         }
+    }
+
+    // Диалог результата QR — закрытие сразу возвращает к скану
+    if (showQrDialog && lastQr != null) {
+        AlertDialog(
+            onDismissRequest = { showQrDialog = false },
+            title = { Text("QR распознан") },
+            text = { Text(lastQr ?: "") },
+            confirmButton = {
+                TextButton(onClick = {
+                    val v = lastQr.orEmpty()
+                    val uri = runCatching { Uri.parse(v) }.getOrNull()
+                    if (uri != null && (v.startsWith("http://") || v.startsWith("https://"))) {
+                        context.startActivity(Intent(Intent.ACTION_VIEW, uri))
+                    } else {
+                        Toast.makeText(context, "Не похоже на URL", Toast.LENGTH_SHORT).show()
+                    }
+                    showQrDialog = false  // вернуться к скану
+                }) { Text("Открыть") }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(onClick = {
+                        val cm = context.getSystemService(ClipboardManager::class.java)
+                        cm.setPrimaryClip(ClipData.newPlainText("QR", lastQr))
+                        Toast.makeText(context, "Скопировано", Toast.LENGTH_SHORT).show()
+                        showQrDialog = false  // вернуться к скану
+                    }) { Text("Копировать") }
+                    TextButton(onClick = { showQrDialog = false }) { Text("Закрыть") }
+                }
+            }
+        )
     }
 }
 
@@ -555,6 +638,48 @@ private fun RecordingHud(elapsed: String) {
     }
 }
 
+@Composable
+private fun QrOverlay() {
+    // Простой рамочный видоискатель и бегущая линия
+    val inf = rememberInfiniteTransition(label = "qr_line")
+    val yShift = inf.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1600, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "qr_line_anim"
+    )
+
+    Box(
+        Modifier
+            .fillMaxSize()
+            .padding(48.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        val frameShape = RoundedCornerShape(18.dp)
+        Box(
+            Modifier
+                .fillMaxWidth(0.75f)
+                .aspectRatio(1f)
+                .border(3.dp, Color(0xAAFFFFFF), frameShape)
+        )
+
+        // бегущая горизонтальная линия
+        Box(
+            Modifier
+                .fillMaxWidth(0.72f)
+                .aspectRatio(1f)
+                .graphicsLayer {
+                    translationY = yShift.value * size.height
+                }
+                .height(2.dp)
+                .background(Color(0xAA00FF8C))
+        )
+    }
+}
+
 /* -------------------- Диалоги / утилиты -------------------- */
 
 @Composable
@@ -609,9 +734,11 @@ private fun ControlBar(
     useFront: Boolean,
     doMirror: Boolean,
     torchOn: Boolean,
+    qrMode: Boolean,
     onToggleCamera: () -> Unit,
     onToggleMirror: () -> Unit,
-    onToggleTorch: () -> Unit
+    onToggleTorch: () -> Unit,
+    onToggleQr: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -624,6 +751,7 @@ private fun ControlBar(
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             SegmentLabel("Камера", Modifier.weight(1f))
             SegmentLabel(if (useFront) "Зеркало" else "Фонарик", Modifier.weight(1f))
+            SegmentLabel("QR-сканер", Modifier.weight(1f))
         }
         Spacer(Modifier.height(6.dp))
         Row(
@@ -637,6 +765,7 @@ private fun ControlBar(
             } else {
                 FancyButton(if (torchOn) "ВКЛ" else "ВЫКЛ", onToggleTorch, Modifier.weight(1f))
             }
+            FancyButton(if (qrMode) "ON" else "OFF", onToggleQr, Modifier.weight(1f))
         }
         Spacer(Modifier.height(6.dp))
         Text("Зеркало • Raf</>Console Studio", color = Color.White.copy(alpha = 0.85f), maxLines = 1)
